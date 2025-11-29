@@ -5,7 +5,6 @@ Data utilities for fetching market data and computing volatility metrics.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
 from typing import Iterable, List, Optional
 
 import numpy as np
@@ -21,6 +20,16 @@ class ExpectedMove:
     strike: float
     move: float
     move_pct: float
+
+
+@dataclass
+class SkewSnapshot:
+    expiration: pd.Timestamp
+    atm_iv: float
+    downside_iv: float
+    upside_iv: float
+    risk_reversal: float
+    butterfly: float
 
 
 def fetch_price_history(ticker: str, period: str = "1y") -> pd.DataFrame:
@@ -98,15 +107,29 @@ def _mid_from_row(row: pd.Series) -> float:
     return np.nan
 
 
-def estimate_expected_move(surface: pd.DataFrame, spot: float) -> Optional[ExpectedMove]:
+def _atm_row(surface: pd.DataFrame, spot: float, expiration: pd.Timestamp) -> Optional[pd.Series]:
+    exp_slice = surface[surface["expiration"] == expiration]
+    if exp_slice.empty:
+        return None
+    exp_slice = exp_slice.sort_values("strike")
+    exp_slice["distance"] = (exp_slice["strike"] - spot).abs()
+    idx = exp_slice["distance"].idxmin()
+    return exp_slice.loc[idx]
+
+
+def estimate_expected_move(
+    surface: pd.DataFrame, spot: float, expiration: Optional[pd.Timestamp] = None
+) -> Optional[ExpectedMove]:
     """
-    Use the nearest expiration ATM straddle to estimate expected move.
+    Use the specified or nearest expiration ATM straddle to estimate expected move.
     Returns None if we cannot compute.
     """
     if surface.empty:
         return None
-    nearest_exp = surface["expiration"].min()
-    exp_slice = surface[surface["expiration"] == nearest_exp]
+    if expiration is None:
+        expiration = surface["expiration"].min()
+
+    exp_slice = surface[surface["expiration"] == expiration]
     if exp_slice.empty:
         return None
 
@@ -132,7 +155,62 @@ def estimate_expected_move(surface: pd.DataFrame, spot: float) -> Optional[Expec
 
     move = call_mid + put_mid
     move_pct = move / spot if spot else np.nan
-    return ExpectedMove(expiration=nearest_exp, strike=float(atm_strike), move=move, move_pct=move_pct)
+    return ExpectedMove(expiration=expiration, strike=float(atm_strike), move=move, move_pct=move_pct)
+
+
+def atm_iv_by_expiration(surface: pd.DataFrame, spot: float) -> pd.DataFrame:
+    """Return ATM IV per expiration."""
+    rows = []
+    for exp, group in surface.groupby(surface["expiration"]):
+        atm_row = _atm_row(surface, spot, exp)
+        if atm_row is None:
+            continue
+        rows.append({"expiration": exp, "atm_iv": atm_row["impliedVolatility"]})
+    return pd.DataFrame(rows).sort_values("expiration")
+
+
+def skew_metrics(surface: pd.DataFrame, spot: float) -> List[SkewSnapshot]:
+    """
+    Approximate skew using +/-10% moneyness IVs for the earliest expirations.
+    Risk reversal = upside IV - downside IV
+    Butterfly = (upside + downside - 2*ATM)
+    """
+    snapshots: List[SkewSnapshot] = []
+    if surface.empty:
+        return snapshots
+    for exp in sorted(surface["expiration"].unique())[:4]:
+        slice_exp = surface[surface["expiration"] == exp].copy()
+        if slice_exp.empty:
+            continue
+        atm = _atm_row(surface, spot, exp)
+        if atm is None:
+            continue
+        downside = (
+            slice_exp[slice_exp["strike"] <= spot * 0.9]
+            .sort_values("strike", ascending=False)
+            .head(1)
+        )
+        upside = (
+            slice_exp[slice_exp["strike"] >= spot * 1.1]
+            .sort_values("strike", ascending=True)
+            .head(1)
+        )
+        downside_iv = downside["impliedVolatility"].iloc[0] if not downside.empty else np.nan
+        upside_iv = upside["impliedVolatility"].iloc[0] if not upside.empty else np.nan
+        atm_iv = atm["impliedVolatility"]
+        risk_reversal = upside_iv - downside_iv if np.isfinite(upside_iv) and np.isfinite(downside_iv) else np.nan
+        butterfly = (upside_iv + downside_iv - 2 * atm_iv) if np.isfinite(upside_iv) and np.isfinite(downside_iv) else np.nan
+        snapshots.append(
+            SkewSnapshot(
+                expiration=exp,
+                atm_iv=float(atm_iv),
+                downside_iv=float(downside_iv) if np.isfinite(downside_iv) else np.nan,
+                upside_iv=float(upside_iv) if np.isfinite(upside_iv) else np.nan,
+                risk_reversal=float(risk_reversal) if np.isfinite(risk_reversal) else np.nan,
+                butterfly=float(butterfly) if np.isfinite(butterfly) else np.nan,
+            )
+        )
+    return snapshots
 
 
 def peer_realized_vols(
@@ -154,4 +232,32 @@ def peer_realized_vols(
             rows.append({"ticker": peer, "realized_vol": np.nan})
     if not rows:
         return pd.DataFrame(columns=["ticker", "realized_vol"])
+    return pd.DataFrame(rows)
+
+
+def peer_atm_iv(
+    tickers: Iterable[str],
+    spot_map: Optional[dict] = None,
+) -> pd.DataFrame:
+    """Approximate ATM implied volatility for each peer using nearest expiration."""
+    rows = []
+    for peer in tickers:
+        peer = peer.strip().upper()
+        if not peer:
+            continue
+        try:
+            spot = None
+            if spot_map and peer in spot_map:
+                spot = spot_map[peer]
+            if spot is None:
+                hist = fetch_price_history(peer, period="1mo")
+                spot = float(hist["Close"].iloc[-1])
+            surface = fetch_options_surface(peer, max_expirations=3)
+            iv_df = atm_iv_by_expiration(surface, spot)
+            atm_iv = iv_df["atm_iv"].iloc[0] if not iv_df.empty else np.nan
+            rows.append({"ticker": peer, "atm_iv": atm_iv})
+        except Exception:
+            rows.append({"ticker": peer, "atm_iv": np.nan})
+    if not rows:
+        return pd.DataFrame(columns=["ticker", "atm_iv"])
     return pd.DataFrame(rows)

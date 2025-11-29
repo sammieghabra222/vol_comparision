@@ -5,8 +5,9 @@ Visual Streamlit app to explore a stock's volatility from an options perspective
 ## Features
 - Expected move visualization from the nearest expiry ATM straddle (price distribution chart).
 - Rolling realized volatility with quick toggles for common lookback windows.
-- Implied volatility surface across expirations/strikes plus ATM term structure.
-- Peer volatility comparison via user-provided tickers.
+- Configurable expected-move expiry selection.
+- Implied volatility surface across expirations/strikes plus ATM term structure and skew snapshots.
+- Peer volatility comparison via user-provided tickers (realized + ATM IV).
 
 ## Getting Started
 1. Create and activate a virtual environment (optional but recommended):
@@ -29,6 +30,7 @@ Visual Streamlit app to explore a stock's volatility from an options perspective
 - Expected move uses the front-month ATM call/put mid-price (or last price if bid/ask unavailable).
 - The IV surface heatmap averages IV by strike/expiry; the term-structure chart selects the ATM IV per expiry.
 - Realized volatility is annualized log-return volatility; peer comparison uses the same lookback window you select.
+- Historical implied volatility time series is not available via Yahoo Finance; overlays use current ATM IV levels. If you have access to a historical options data provider, we can integrate it for full IV history.
 
 ## Next Ideas
 - Add caching/persistence for frequently viewed tickers.
