@@ -1,5 +1,5 @@
 import math
-from typing import List, Optional
+from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -13,6 +13,7 @@ from data import (
     estimate_expected_move,
     fetch_options_surface,
     fetch_price_history,
+    front_atm_iv,
     peer_atm_iv,
     peer_realized_vols,
     realized_vol_series,
@@ -51,6 +52,9 @@ def expected_move_chart(spot: float, expected: ExpectedMove | None) -> go.Figure
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=x_vals, y=pdf, mode="lines", fill="tozeroy", name="Expected distribution"))
     fig.add_vrect(x0=spot - sigma, x1=spot + sigma, fillcolor="LightSkyBlue", opacity=0.3, line_width=0, name="±1σ")
+    for k, color in [(1, "LightSkyBlue"), (2, "LightGreen"), (3, "LightSalmon")]:
+        fig.add_vline(x=spot + k * sigma, line_dash="dot", line_color=color, annotation_text=f"+{k}σ")
+        fig.add_vline(x=spot - k * sigma, line_dash="dot", line_color=color, annotation_text=f"-{k}σ")
     fig.add_vline(x=spot, line_dash="dash", line_color="black", name="Spot")
     fig.update_layout(
         title=f"Expected Move into {expected.expiration.date()}",
@@ -105,11 +109,20 @@ def term_structure_chart(surface: pd.DataFrame, spot: float, realized_anchor: Op
     return fig
 
 
-def historical_vol_chart(history: pd.DataFrame, window: int, iv_overlay: Optional[float] = None) -> go.Figure:
+def historical_vol_chart(
+    history: pd.DataFrame,
+    window: int,
+    overlays: Optional[Sequence[Tuple[str, float]]] = None,
+) -> go.Figure:
     series = realized_vol_series(history, window=window)
     fig = px.line(series, labels={"value": "Realized Vol", "index": "Date"})
-    if iv_overlay is not None and np.isfinite(iv_overlay):
-        fig.add_hline(y=iv_overlay, line_dash="dash", line_color="crimson", annotation_text="Current ATM IV")
+    overlays = overlays or []
+    colors = ["crimson", "gray", "teal", "orange"]
+    for idx, (label, value) in enumerate(overlays):
+        if value is None or not np.isfinite(value):
+            continue
+        color = colors[idx % len(colors)]
+        fig.add_hline(y=value, line_dash="dash", line_color=color, annotation_text=label)
     fig.update_layout(title=f"Rolling Realized Volatility (window={window}d)", yaxis_tickformat=".0%")
     return fig
 
@@ -190,6 +203,33 @@ def skew_insights(skews: List) -> List[str]:
     return insights or ["Skew appears flat near ATM."]
 
 
+def momentum_metrics(history: pd.DataFrame) -> pd.DataFrame:
+    close = history["Close"]
+    returns = close.pct_change()
+    metrics = {}
+    for label, days in [("1m", 21), ("3m", 63), ("6m", 126), ("1y", 252)]:
+        if len(close) >= days:
+            metrics[f"return_{label}"] = close.iloc[-1] / close.iloc[-days] - 1
+    # RSI(14)
+    delta = close.diff()
+    up = delta.clip(lower=0)
+    down = -delta.clip(upper=0)
+    roll_up = up.rolling(14).mean()
+    roll_down = down.rolling(14).mean()
+    rs = roll_up / roll_down
+    rsi = 100 - (100 / (1 + rs))
+    metrics["rsi14"] = rsi.iloc[-1] if not rsi.empty else np.nan
+    # MACD 12-26 with signal 9
+    ema12 = close.ewm(span=12, adjust=False).mean()
+    ema26 = close.ewm(span=26, adjust=False).mean()
+    macd = ema12 - ema26
+    signal = macd.ewm(span=9, adjust=False).mean()
+    metrics["macd"] = macd.iloc[-1]
+    metrics["macd_signal"] = signal.iloc[-1]
+    metrics["macd_hist"] = metrics["macd"] - metrics["macd_signal"]
+    return pd.DataFrame([metrics])
+
+
 def main():
     st.title("Options Volatility Lab")
     st.caption("Visualize implied and historical volatility from an options perspective.")
@@ -233,18 +273,23 @@ def main():
     term_df = pd.DataFrame()
     skews = []
     atm_iv_front = None
+    spy_atm_iv = None
     expirations = []
     if not surface.empty:
         expirations = sorted(surface["expiration"].unique())
         term_df = atm_iv_by_expiration(surface, spot)
         atm_iv_front = term_df["atm_iv"].iloc[0] if not term_df.empty else None
         skews = skew_metrics(surface, spot)
-        iv_overlay = atm_iv_front
-    else:
-        iv_overlay = None
+    # Fetch SPY ATM IV for overlay comparison
+    spy_atm_iv = front_atm_iv("SPY")
 
     # Historical volatility section (with optional IV overlay)
-    vol_series_fig = historical_vol_chart(history, realized_window, iv_overlay=iv_overlay)
+    overlays = []
+    if atm_iv_front is not None:
+        overlays.append(("Current ATM IV", atm_iv_front))
+    if spy_atm_iv is not None:
+        overlays.append(("SPY ATM IV", spy_atm_iv))
+    vol_series_fig = historical_vol_chart(history, realized_window, overlays=overlays)
     vol_snapshot = realized_vol_snapshot(history, windows=[10, 20, 30, 60, 90, 180])
     snapshot_df = pd.DataFrame(
         [{"window": f"{w}d", "vol": vol_snapshot[w]} for w in sorted(vol_snapshot.keys())]
@@ -324,6 +369,15 @@ def main():
         exp_slice = exp_slice[display_cols]
         exp_slice["impliedVolatility"] = exp_slice["impliedVolatility"].apply(format_pct)
         st.dataframe(exp_slice, use_container_width=True, height=260)
+
+    # Momentum metrics
+    st.subheader("Momentum Snapshot")
+    momentum_df = momentum_metrics(history)
+    display_mom = momentum_df.copy()
+    for col in display_mom.columns:
+        if col.startswith("return_"):
+            display_mom[col] = display_mom[col].apply(format_pct)
+    st.dataframe(display_mom, use_container_width=True, height=140)
 
     # Peer comparison
     peer_list: List[str] = [p.strip().upper() for p in peer_input.split(",") if p.strip()]

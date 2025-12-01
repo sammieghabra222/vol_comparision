@@ -261,3 +261,17 @@ def peer_atm_iv(
     if not rows:
         return pd.DataFrame(columns=["ticker", "atm_iv"])
     return pd.DataFrame(rows)
+
+
+def front_atm_iv(ticker: str, max_expirations: int = 3) -> Optional[float]:
+    """Convenience helper to fetch the front-month ATM IV for a single ticker."""
+    try:
+        history = fetch_price_history(ticker, period="1mo")
+        spot = float(history["Close"].iloc[-1])
+        surface = fetch_options_surface(ticker, max_expirations=max_expirations)
+        iv_df = atm_iv_by_expiration(surface, spot)
+        if iv_df.empty:
+            return None
+        return float(iv_df["atm_iv"].iloc[0])
+    except Exception:
+        return None
